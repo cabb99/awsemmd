@@ -1342,7 +1342,7 @@ inline void FixBackbone::Construct_Computational_Arrays()
   for (i = 0; i < nn; ++i) {
     chain_no[i] = -1;
 	
-    // Checking sequance and marking residues
+    // Checking sequence and marking residues
     if (alpha_carbons[i]!=-1) {
 			
       // Making sure chain tags match for same residue atoms
@@ -4316,9 +4316,9 @@ void FixBackbone::compute_tert_frust()
   double rij, rho_i, rho_j;
   double native_energy;
   double frustration_index;
-  int atomselect;
+  //int atomselect;
 
-  atomselect = 0; // for the vmd script output
+  //atomselect = 0; // for the vmd script output
 
   // Double loop over all residue pairs
   for (i=0;i<n;++i) {
@@ -4355,15 +4355,17 @@ void FixBackbone::compute_tert_frust()
 	}
 	frustration_index = compute_frustration_index(native_energy, decoy_ixn_stats);
 	// write information out to output file
+	//i j i_chain j_chain xi yi zi xj yj zj r_ij rho_i rho_j a_i a_j native_energy <decoy_energies> std(decoy_energies) f_ij
  	fprintf(tert_frust_output_file,"%5d %5d %3d %3d %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %c %c %8.3f %8.3f %8.3f %8.3f\n", i_resno+1, j_resno+1, i_chno+1, j_chno+1, xi[0], xi[1], xi[2], xj[0], xj[1], xj[2], rij, rho_i, rho_j, se[i_resno], se[j_resno], native_energy, decoy_ixn_stats[0], decoy_ixn_stats[1], frustration_index);
 	if(frustration_index > 0.78 || frustration_index < -1) {
 	  // write information out to vmd script
-	  fprintf(tert_frust_vmd_script,"set sel%d [atomselect top \"resid %d and name CA\"]\n", i_resno, i_resno+1);
-	  fprintf(tert_frust_vmd_script,"set sel%d [atomselect top \"resid %d and name CA\"]\n", j_resno, j_resno+1);
-	  fprintf(tert_frust_vmd_script,"lassign [atomselect%d get {x y z}] pos1\n",atomselect);
-	  atomselect += 1;
-	  fprintf(tert_frust_vmd_script,"lassign [atomselect%d get {x y z}] pos2\n",atomselect);
-	  atomselect += 1;
+      fprintf(tert_frust_vmd_script,"set sel%d [atomselect top \"resid %d and name CA\"]\n", i_resno, i_resno+1);
+      fprintf(tert_frust_vmd_script,"set sel%d [atomselect top \"resid %d and name CA\"]\n", j_resno, j_resno+1);
+      fprintf(tert_frust_vmd_script,"lassign [$sel%d get {x y z}] pos1\n",i_resno);
+      fprintf(tert_frust_vmd_script,"lassign [$sel%d get {x y z}] pos2\n",j_resno);
+      //free memory on vmd
+      fprintf(tert_frust_vmd_script,"$sel%d delete\n",i_resno);
+      fprintf(tert_frust_vmd_script,"$sel%d delete\n",j_resno);
 	  if(frustration_index > 0.78) {
 	    fprintf(tert_frust_vmd_script,"draw color green\n");
 	  }
