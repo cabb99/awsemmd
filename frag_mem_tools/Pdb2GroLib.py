@@ -1,3 +1,4 @@
+#!/usr/bin/python
 # ----------------------------------------------------------------------
 # Copyright (2010) Aram Davtyan and Garegin Papoian
 #
