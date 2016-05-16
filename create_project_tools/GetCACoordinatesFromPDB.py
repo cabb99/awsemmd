@@ -1,4 +1,4 @@
-#!/shared/local/bin/python
+#!/usr/bin/python
 
 import sys
 
