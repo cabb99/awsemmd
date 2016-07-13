@@ -11,15 +11,16 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
-#include "mpi.h"
-#include "math.h"
-#include "stdio.h"
-#include "string.h"
-#include "stdlib.h"
+#include <mpi.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "group.h"
 #include "domain.h"
 #include "atom.h"
 #include "force.h"
+#include "comm.h"
 #include "region.h"
 #include "modify.h"
 #include "fix.h"
@@ -31,6 +32,8 @@
 #include "memory.h"
 #include "error.h"
 
+#include <map>
+
 using namespace LAMMPS_NS;
 
 #define MAX_GROUP 32
@@ -39,6 +42,10 @@ enum{TYPE,MOLECULE,ID};
 enum{LT,LE,GT,GE,EQ,NEQ,BETWEEN};
 
 #define BIG 1.0e20
+
+// allocate space for static class variable
+
+Group *Group::cptr;
 
 /* ----------------------------------------------------------------------
    initialize group memory
@@ -51,10 +58,12 @@ Group::Group(LAMMPS *lmp) : Pointers(lmp)
   names = new char*[MAX_GROUP];
   bitmask = new int[MAX_GROUP];
   inversemask = new int[MAX_GROUP];
+  dynamic = new int[MAX_GROUP];
 
   for (int i = 0; i < MAX_GROUP; i++) names[i] = NULL;
   for (int i = 0; i < MAX_GROUP; i++) bitmask[i] = 1 << i;
   for (int i = 0; i < MAX_GROUP; i++) inversemask[i] = bitmask[i] ^ ~0;
+  for (int i = 0; i < MAX_GROUP; i++) dynamic[i] = 0;
 
   // create "all" group
 
@@ -75,6 +84,7 @@ Group::~Group()
   delete [] names;
   delete [] bitmask;
   delete [] inversemask;
+  delete [] dynamic;
 }
 
 /* ----------------------------------------------------------------------
@@ -114,9 +124,33 @@ void Group::assign(int narg, char **arg)
     int bits = inversemask[igroup];
     for (i = 0; i < nlocal; i++) mask[i] &= bits;
 
+    if (dynamic[igroup]) {
+      int n = strlen("GROUP_") + strlen(names[igroup]) + 1;
+      char *fixID = new char[n];
+      sprintf(fixID,"GROUP_%s",names[igroup]);
+      modify->delete_fix(fixID);
+      delete [] fixID;
+    }
+
     delete [] names[igroup];
     names[igroup] = NULL;
+    dynamic[igroup] = 0;
     ngroup--;
+
+    return;
+  }
+
+  // clear the group
+
+  if (strcmp(arg[1],"clear") == 0) {
+    int igroup = find(arg[0]);
+    if (igroup == -1) error->all (FLERR,"Could not find group clear group ID");
+    if (igroup == 0) error->all (FLERR,"Cannot clear group all");
+
+    int *mask = atom->mask;
+    int nlocal = atom->nlocal;
+    int bits = inversemask[igroup];
+    for (i = 0; i < nlocal; i++) mask[i] &= bits;
 
     return;
   }
@@ -142,7 +176,6 @@ void Group::assign(int narg, char **arg)
 
   // style = region
   // add to group if atom is in region
-  // init all regions via domain->init() to insure region can perform match()
 
   if (strcmp(arg[1],"region") == 0) {
 
@@ -150,101 +183,154 @@ void Group::assign(int narg, char **arg)
 
     int iregion = domain->find_region(arg[2]);
     if (iregion == -1) error->all(FLERR,"Group region ID does not exist");
-    domain->init();
+    domain->regions[iregion]->init();
+    domain->regions[iregion]->prematch();
 
     for (i = 0; i < nlocal; i++)
       if (domain->regions[iregion]->match(x[i][0],x[i][1],x[i][2]))
         mask[i] |= bit;
 
-  // style = logical condition
-
-  } else if (narg >= 3 &&
-             (strcmp(arg[2],"<") == 0 || strcmp(arg[2],">") == 0 ||
-              strcmp(arg[2],"<=") == 0 || strcmp(arg[2],">=") == 0 ||
-              strcmp(arg[2],"<>") == 0)) {
-
-    if (narg < 4 || narg > 5) error->all(FLERR,"Illegal group command");
-    int category,condition,bound1,bound2;
-
-    if (strcmp(arg[1],"type") == 0) category = TYPE;
-    else if (strcmp(arg[1],"molecule") == 0) category = MOLECULE;
-    else if (strcmp(arg[1],"id") == 0) category = ID;
-    else error->all(FLERR,"Illegal group command");
-
-    if (strcmp(arg[2],"<") == 0) condition = LT;
-    else if (strcmp(arg[2],"<=") == 0) condition = LE;
-    else if (strcmp(arg[2],">") == 0) condition = GT;
-    else if (strcmp(arg[2],">=") == 0) condition = GE;
-    else if (strcmp(arg[2],"==") == 0) condition = EQ;
-    else if (strcmp(arg[2],"!=") == 0) condition = NEQ;
-    else if (strcmp(arg[2],"<>") == 0) condition = BETWEEN;
-    else error->all(FLERR,"Illegal group command");
-
-    bound1 = atoi(arg[3]);
-    bound2 = -1;
-
-    if (condition == BETWEEN) {
-      if (narg != 5) error->all(FLERR,"Illegal group command");
-      bound2 = atoi(arg[4]);
-    }
-
-    int *attribute;
-    if (category == TYPE) attribute = atom->type;
-    else if (category == MOLECULE) attribute = atom->molecule;
-    else if (category == ID) attribute = atom->tag;
-
-    // add to group if meets condition
-
-    if (condition == LT) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] < bound1) mask[i] |= bit;
-    } else if (condition == LE) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] <= bound1) mask[i] |= bit;
-    } else if (condition == GT) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] > bound1) mask[i] |= bit;
-    } else if (condition == GE) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] >= bound1) mask[i] |= bit;
-    } else if (condition == EQ) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] == bound1) mask[i] |= bit;
-    } else if (condition == NEQ) {
-      for (i = 0; i < nlocal; i++) if (attribute[i] != bound1) mask[i] |= bit;
-    } else if (condition == BETWEEN) {
-      for (i = 0; i < nlocal; i++)
-        if (attribute[i] >= bound1 && attribute[i] <= bound2) mask[i] |= bit;
-    }
-
-  // style = list of values
+  // style = type, molecule, id
+  // add to group if atom matches type/molecule/id or condition
 
   } else if (strcmp(arg[1],"type") == 0 || strcmp(arg[1],"molecule") == 0 ||
              strcmp(arg[1],"id") == 0) {
 
     if (narg < 3) error->all(FLERR,"Illegal group command");
 
-    int length = narg-2;
-    int *list = new int[length];
-
     int category;
     if (strcmp(arg[1],"type") == 0) category = TYPE;
     else if (strcmp(arg[1],"molecule") == 0) category = MOLECULE;
     else if (strcmp(arg[1],"id") == 0) category = ID;
-    else error->all(FLERR,"Illegal group command");
 
-    length = narg - 2;
-    for (int iarg = 2; iarg < narg; iarg++) list[iarg-2] = atoi(arg[iarg]);
+    // args = logical condition
 
-    int *attribute;
-    if (category == TYPE) attribute = atom->type;
-    else if (category == MOLECULE) attribute = atom->molecule;
-    else if (category == ID) attribute = atom->tag;
+    if (narg > 3 &&
+        (strcmp(arg[2],"<") == 0 || strcmp(arg[2],">") == 0 ||
+         strcmp(arg[2],"<=") == 0 || strcmp(arg[2],">=") == 0 ||
+         strcmp(arg[2],"==") == 0 || strcmp(arg[2],"!=") == 0 ||
+         strcmp(arg[2],"<>") == 0)) {
 
-    // add to group if attribute is any in list
+      int condition = -1;
+      if (strcmp(arg[2],"<") == 0) condition = LT;
+      else if (strcmp(arg[2],"<=") == 0) condition = LE;
+      else if (strcmp(arg[2],">") == 0) condition = GT;
+      else if (strcmp(arg[2],">=") == 0) condition = GE;
+      else if (strcmp(arg[2],"==") == 0) condition = EQ;
+      else if (strcmp(arg[2],"!=") == 0) condition = NEQ;
+      else if (strcmp(arg[2],"<>") == 0) condition = BETWEEN;
+      else error->all(FLERR,"Illegal group command");
 
-    for (int ilist = 0; ilist < length; ilist++)
-      for (i = 0; i < nlocal; i++)
-        if (attribute[i] == list[ilist]) mask[i] |= bit;
+      tagint bound1,bound2;
+      bound1 = force->tnumeric(FLERR,arg[3]);
+      bound2 = -1;
 
-    delete [] list;
+      if (condition == BETWEEN) {
+        if (narg != 5) error->all(FLERR,"Illegal group command");
+        bound2 = force->tnumeric(FLERR,arg[4]);
+      } else if (narg != 4) error->all(FLERR,"Illegal group command");
+
+      int *attribute = NULL;
+      tagint *tattribute = NULL;
+      if (category == TYPE) attribute = atom->type;
+      else if (category == MOLECULE) tattribute = atom->molecule;
+      else if (category == ID) tattribute = atom->tag;
+
+      // add to group if meets condition
+
+      if (attribute) {
+        if (condition == LT) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] < bound1) mask[i] |= bit;
+        } else if (condition == LE) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] <= bound1) mask[i] |= bit;
+        } else if (condition == GT) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] > bound1) mask[i] |= bit;
+        } else if (condition == GE) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] >= bound1) mask[i] |= bit;
+        } else if (condition == EQ) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] == bound1) mask[i] |= bit;
+        } else if (condition == NEQ) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] != bound1) mask[i] |= bit;
+        } else if (condition == BETWEEN) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] >= bound1 && attribute[i] <= bound2)
+              mask[i] |= bit;
+        }
+      } else {
+        if (condition == LT) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] < bound1) mask[i] |= bit;
+        } else if (condition == LE) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] <= bound1) mask[i] |= bit;
+        } else if (condition == GT) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] > bound1) mask[i] |= bit;
+        } else if (condition == GE) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] >= bound1) mask[i] |= bit;
+        } else if (condition == EQ) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] == bound1) mask[i] |= bit;
+        } else if (condition == NEQ) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] != bound1) mask[i] |= bit;
+        } else if (condition == BETWEEN) {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] >= bound1 && tattribute[i] <= bound2)
+              mask[i] |= bit;
+        }
+      }
+
+    // args = list of values
+
+    } else {
+      int *attribute = NULL;
+      tagint *tattribute = NULL;
+      if (category == TYPE) attribute = atom->type;
+      else if (category == MOLECULE) tattribute = atom->molecule;
+      else if (category == ID) tattribute = atom->tag;
+
+      char *ptr;
+      tagint start,stop,delta;
+
+      for (int iarg = 2; iarg < narg; iarg++) {
+        delta = 1;
+        if (strchr(arg[iarg],':')) {
+          ptr = strtok(arg[iarg],":");
+          start = force->tnumeric(FLERR,ptr);
+          ptr = strtok(NULL,":");
+          stop = force->tnumeric(FLERR,ptr);
+          ptr = strtok(NULL,":");
+          if (ptr) delta = force->tnumeric(FLERR,ptr);
+        } else {
+          start = stop = force->tnumeric(FLERR,arg[iarg]);
+        }
+        if (delta < 1)
+          error->all(FLERR,"Illegal range increment value");
+
+        // add to group if attribute matches value or sequence
+
+        if (attribute) {
+          for (i = 0; i < nlocal; i++)
+            if (attribute[i] >= start && attribute[i] <= stop &&
+                (attribute[i]-start) % delta == 0) mask[i] |= bit;
+        } else {
+          for (i = 0; i < nlocal; i++)
+            if (tattribute[i] >= start && tattribute[i] <= stop &&
+                (tattribute[i]-start) % delta == 0) mask[i] |= bit;
+        }
+      }
+    }
 
   // style = variable
+  // add to group if atom-atyle variable is non-zero
 
   } else if (strcmp(arg[1],"variable") == 0) {
 
@@ -254,7 +340,7 @@ void Group::assign(int narg, char **arg)
       error->all(FLERR,"Variable for group is invalid style");
 
     double *aflag;
-    
+
     // aflag = evaluation of per-atom variable
 
     memory->create(aflag,nlocal,"group:aflag");
@@ -266,6 +352,16 @@ void Group::assign(int narg, char **arg)
       if (aflag[i] != 0.0) mask[i] |= bit;
 
     memory->destroy(aflag);
+
+  // style = include
+
+  } else if (strcmp(arg[1],"include") == 0) {
+
+    if (narg != 3) error->all(FLERR,"Illegal group command");
+    if (strcmp(arg[2],"molecule") != 0)
+      error->all(FLERR,"Illegal group command");
+
+    add_molecules(igroup,bit);
 
   // style = subtract
 
@@ -280,6 +376,8 @@ void Group::assign(int narg, char **arg)
     for (int iarg = 2; iarg < narg; iarg++) {
       jgroup = find(arg[iarg]);
       if (jgroup == -1) error->all(FLERR,"Group ID does not exist");
+      if (dynamic[jgroup])
+        error->all(FLERR,"Cannot subtract groups using a dynamic group");
       list[iarg-2] = jgroup;
     }
 
@@ -316,6 +414,8 @@ void Group::assign(int narg, char **arg)
     for (int iarg = 2; iarg < narg; iarg++) {
       jgroup = find(arg[iarg]);
       if (jgroup == -1) error->all(FLERR,"Group ID does not exist");
+      if (dynamic[jgroup])
+        error->all(FLERR,"Cannot union groups using a dynamic group");
       list[iarg-2] = jgroup;
     }
 
@@ -344,6 +444,8 @@ void Group::assign(int narg, char **arg)
     for (int iarg = 2; iarg < narg; iarg++) {
       jgroup = find(arg[iarg]);
       if (jgroup == -1) error->all(FLERR,"Group ID does not exist");
+      if (dynamic[jgroup])
+        error->all(FLERR,"Cannot intersect groups using a dynamic group");
       list[iarg-2] = jgroup;
     }
 
@@ -362,6 +464,60 @@ void Group::assign(int narg, char **arg)
 
     delete [] list;
 
+  // style = dynamic
+  // create a new FixGroup to dynamically determine atoms in group
+
+  } else if (strcmp(arg[1],"dynamic") == 0) {
+
+    if (narg < 4) error->all(FLERR,"Illegal group command");
+    if (strcmp(arg[0],arg[2]) == 0)
+      error->all(FLERR,"Group dynamic cannot reference itself");
+    if (find(arg[2]) < 0)
+      error->all(FLERR,"Group dynamic parent group does not exist");
+    if (igroup == 0) error->all(FLERR,"Group all cannot be made dynamic");
+
+    // if group is already dynamic, delete existing FixGroup
+
+    if (dynamic[igroup]) {
+      int n = strlen("GROUP_") + strlen(names[igroup]) + 1;
+      char *fixID = new char[n];
+      sprintf(fixID,"GROUP_%s",names[igroup]);
+      modify->delete_fix(fixID);
+      delete [] fixID;
+    }
+
+    dynamic[igroup] = 1;
+
+    int n = strlen("GROUP_") + strlen(names[igroup]) + 1;
+    char *fixID = new char[n];
+    sprintf(fixID,"GROUP_%s",names[igroup]);
+
+    char **newarg = new char*[narg];
+    newarg[0] = fixID;
+    newarg[1] = arg[2];
+    newarg[2] = (char *) "GROUP";
+    for (int i = 3; i < narg; i++) newarg[i] = arg[i];
+    modify->add_fix(narg,newarg);
+    delete [] newarg;
+    delete [] fixID;
+
+  // style = static
+  // remove dynamic FixGroup if necessary
+
+  } else if (strcmp(arg[1],"static") == 0) {
+
+    if (narg != 2) error->all(FLERR,"Illegal group command");
+
+    if (dynamic[igroup]) {
+      int n = strlen("GROUP_") + strlen(names[igroup]) + 1;
+      char *fixID = new char[n];
+      sprintf(fixID,"GROUP_%s",names[igroup]);
+      modify->delete_fix(fixID);
+      delete [] fixID;
+    }
+
+    dynamic[igroup] = 0;
+
   // not a valid group style
 
   } else error->all(FLERR,"Illegal group command");
@@ -377,9 +533,15 @@ void Group::assign(int narg, char **arg)
   MPI_Allreduce(&rlocal,&all,1,MPI_DOUBLE,MPI_SUM,world);
 
   if (me == 0) {
-    if (screen) fprintf(screen,"%.15g atoms in group %s\n",all,names[igroup]);
-    if (logfile)
-      fprintf(logfile,"%.15g atoms in group %s\n",all,names[igroup]);
+    if (dynamic[igroup]) {
+      if (screen) fprintf(screen,"dynamic group %s defined\n",names[igroup]);
+      if (logfile) fprintf(logfile,"dynamic group %s defined\n",names[igroup]);
+    } else {
+      if (screen)
+        fprintf(screen,"%.15g atoms in group %s\n",all,names[igroup]);
+      if (logfile)
+        fprintf(logfile,"%.15g atoms in group %s\n",all,names[igroup]);
+    }
   }
 }
 
@@ -427,6 +589,26 @@ int Group::find(const char *name)
 }
 
 /* ----------------------------------------------------------------------
+   find group with name or create group if it doesn't exist
+   return group index
+------------------------------------------------------------------------- */
+
+int Group::find_or_create(const char *name)
+{
+  int igroup = find(name);
+  if (igroup >= 0) return igroup;
+
+  if (ngroup == MAX_GROUP) error->all(FLERR,"Too many groups");
+  igroup = find_unused();
+  int n = strlen(name) + 1;
+  names[igroup] = new char[n];
+  strcpy(names[igroup],name);
+  ngroup++;
+
+  return igroup;
+}
+
+/* ----------------------------------------------------------------------
    return index of first available group
    should never be called when group limit has been reached
 ------------------------------------------------------------------------- */
@@ -436,6 +618,69 @@ int Group::find_unused()
   for (int igroup = 0; igroup < MAX_GROUP; igroup++)
     if (names[igroup] == NULL) return igroup;
   return -1;
+}
+
+/* ----------------------------------------------------------------------
+   add atoms to group that are in same molecules as atoms already in group
+   do not include molID = 0
+------------------------------------------------------------------------- */
+
+void Group::add_molecules(int igroup, int bit)
+{
+  // hash = unique molecule IDs of atoms already in group
+
+  hash = new std::map<tagint,int>();
+
+  tagint *molecule = atom->molecule;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  for (int i = 0; i < nlocal; i++)
+    if (mask[i] & bit) {
+      if (molecule[i] == 0) continue;
+      if (hash->find(molecule[i]) == hash->end()) (*hash)[molecule[i]] = 1;
+    }
+
+  // list = set of unique molecule IDs for atoms to add
+  // pass list to all other procs via comm->ring()
+
+  int n = hash->size();
+  tagint *list;
+  memory->create(list,n,"group:list");
+
+  n = 0;
+  std::map<tagint,int>::iterator pos;
+  for (pos = hash->begin(); pos != hash->end(); ++pos) list[n++] = pos->first;
+
+  cptr = this;
+  molbit = bit;
+  comm->ring(n,sizeof(tagint),list,1,molring,NULL);
+
+  delete hash;
+  memory->destroy(list);
+}
+
+/* ----------------------------------------------------------------------
+   callback from comm->ring()
+   cbuf = list of N molecule IDs, put them in hash
+   loop over my atoms, if matches molecule ID in hash,
+     add atom to group flagged by molbit
+------------------------------------------------------------------------- */
+
+void Group::molring(int n, char *cbuf)
+{
+  tagint *list = (tagint *) cbuf;
+  std::map<tagint,int> *hash = cptr->hash;
+  int nlocal = cptr->atom->nlocal;
+  tagint *molecule = cptr->atom->molecule;
+  int *mask = cptr->atom->mask;
+  int molbit = cptr->molbit;
+
+  hash->clear();
+  for (int i = 0; i < n; i++) (*hash)[list[i]] = 1;
+
+  for (int i = 0; i < nlocal; i++)
+    if (hash->find(molecule[i]) != hash->end()) mask[i] |= molbit;
 }
 
 /* ----------------------------------------------------------------------
@@ -534,6 +779,7 @@ bigint Group::count(int igroup, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   int *mask = atom->mask;
@@ -588,6 +834,7 @@ double Group::mass(int igroup, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double *mass = atom->mass;
@@ -642,6 +889,7 @@ double Group::charge(int igroup, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double *q = atom->q;
@@ -710,6 +958,7 @@ void Group::bounds(int igroup, double *minmax, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double extent[6];
   extent[0] = extent[2] = extent[4] = BIG;
@@ -759,41 +1008,34 @@ void Group::xcm(int igroup, double masstotal, double *cm)
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
   double cmone[3];
   cmone[0] = cmone[1] = cmone[2] = 0.0;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
 
-  int xbox,ybox,zbox;
   double massone;
+  double unwrap[3];
 
   if (rmass) {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit) {
-        xbox = (image[i] & IMGMASK) - IMGMAX;
-        ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-        zbox = (image[i] >> IMG2BITS) - IMGMAX;
         massone = rmass[i];
-        cmone[0] += (x[i][0] + xbox*xprd) * massone;
-        cmone[1] += (x[i][1] + ybox*yprd) * massone;
-        cmone[2] += (x[i][2] + zbox*zprd) * massone;
+        domain->unmap(x[i],image[i],unwrap);
+        cmone[0] += unwrap[0] * massone;
+        cmone[1] += unwrap[1] * massone;
+        cmone[2] += unwrap[2] * massone;
       }
   } else {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit) {
-        xbox = (image[i] & IMGMASK) - IMGMAX;
-        ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-        zbox = (image[i] >> IMG2BITS) - IMGMAX;
         massone = mass[type[i]];
-        cmone[0] += (x[i][0] + xbox*xprd) * massone;
-        cmone[1] += (x[i][1] + ybox*yprd) * massone;
-        cmone[2] += (x[i][2] + zbox*zprd) * massone;
+        domain->unmap(x[i],image[i],unwrap);
+        cmone[0] += unwrap[0] * massone;
+        cmone[1] += unwrap[1] * massone;
+        cmone[2] += unwrap[2] * massone;
       }
   }
 
@@ -816,45 +1058,39 @@ void Group::xcm(int igroup, double masstotal, double *cm, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
   double cmone[3];
   cmone[0] = cmone[1] = cmone[2] = 0.0;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
 
-  int xbox,ybox,zbox;
   double massone;
+  double unwrap[3];
 
   if (rmass) {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-        xbox = (image[i] & IMGMASK) - IMGMAX;
-        ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-        zbox = (image[i] >> IMG2BITS) - IMGMAX;
         massone = rmass[i];
-        cmone[0] += (x[i][0] + xbox*xprd) * massone;
-        cmone[1] += (x[i][1] + ybox*yprd) * massone;
-        cmone[2] += (x[i][2] + zbox*zprd) * massone;
+        domain->unmap(x[i],image[i],unwrap);
+        cmone[0] += unwrap[0] * massone;
+        cmone[1] += unwrap[1] * massone;
+        cmone[2] += unwrap[2] * massone;
       }
   } else {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-        xbox = (image[i] & IMGMASK) - IMGMAX;
-        ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-        zbox = (image[i] >> IMG2BITS) - IMGMAX;
         massone = mass[type[i]];
-        cmone[0] += (x[i][0] + xbox*xprd) * massone;
-        cmone[1] += (x[i][1] + ybox*yprd) * massone;
-        cmone[2] += (x[i][2] + zbox*zprd) * massone;
+        domain->unmap(x[i],image[i],unwrap);
+        cmone[0] += unwrap[0] * massone;
+        cmone[1] += unwrap[1] * massone;
+        cmone[2] += unwrap[2] * massone;
       }
   }
 
@@ -922,6 +1158,7 @@ void Group::vcm(int igroup, double masstotal, double *cm, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double **v = atom->v;
@@ -993,6 +1230,7 @@ void Group::fcm(int igroup, double *cm, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double **f = atom->f;
@@ -1055,6 +1293,7 @@ double Group::ke(int igroup, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double **v = atom->v;
@@ -1097,26 +1336,21 @@ double Group::gyration(int igroup, double masstotal, double *cm)
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
   double rg = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       rg += (dx*dx + dy*dy + dz*dz) * massone;
@@ -1138,30 +1372,26 @@ double Group::gyration(int igroup, double masstotal, double *cm, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
   double rg = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       rg += (dx*dx + dy*dy + dz*dz) * massone;
@@ -1174,8 +1404,8 @@ double Group::gyration(int igroup, double masstotal, double *cm, int iregion)
 }
 
 /* ----------------------------------------------------------------------
-   compute the cylindrical radius-of-gyration of group of atoms
-   around center-of-mass cm in the x/y plane
+   compute the radius-of-gyration of group of atoms
+   around center-of-mass cm
    must unwrap atoms to compute Rg correctly
 ------------------------------------------------------------------------- */
 
@@ -1186,23 +1416,20 @@ double Group::cylindricalgyration(int igroup, double masstotal, double *cm)
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox;
-  double dx,dy,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
+  double dx,dy,dz,massone;
+  double unwrap[3];
   double rg = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       rg += (dx*dx + dy*dy) * massone;
@@ -1213,6 +1440,8 @@ double Group::cylindricalgyration(int igroup, double masstotal, double *cm)
   if (masstotal > 0.0) return sqrt(rg_all/masstotal);
   return 0.0;
 }
+
+
 
 /* ----------------------------------------------------------------------
    compute the angular momentum L (lmom) of group
@@ -1228,27 +1457,23 @@ void Group::angmom(int igroup, double *cm, double *lmom)
   double **v = atom->v;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double p[3];
   p[0] = p[1] = p[2] = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       p[0] += massone * (dy*v[i][2] - dz*v[i][1]);
@@ -1269,32 +1494,29 @@ void Group::angmom(int igroup, double *cm, double *lmom, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double **v = atom->v;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double p[3];
   p[0] = p[1] = p[2] = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       p[0] += massone * (dy*v[i][2] - dz*v[i][1]);
@@ -1318,25 +1540,21 @@ void Group::torque(int igroup, double *cm, double *tq)
   double **x = atom->x;
   double **f = atom->f;
   int *mask = atom->mask;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double tlocal[3];
   tlocal[0] = tlocal[1] = tlocal[2] = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       tlocal[0] += dy*f[i][2] - dz*f[i][1];
       tlocal[1] += dz*f[i][0] - dx*f[i][2];
       tlocal[2] += dx*f[i][1] - dy*f[i][0];
@@ -1355,29 +1573,26 @@ void Group::torque(int igroup, double *cm, double *tq, int iregion)
 {
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   double **f = atom->f;
   int *mask = atom->mask;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double tlocal[3];
   tlocal[0] = tlocal[1] = tlocal[2] = 0.0;
 
   for (int i = 0; i < nlocal; i++)
     if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       tlocal[0] += dy*f[i][2] - dz*f[i][1];
       tlocal[1] += dz*f[i][0] - dx*f[i][2];
       tlocal[2] += dx*f[i][1] - dy*f[i][0];
@@ -1400,16 +1615,14 @@ void Group::inertia(int igroup, double *cm, double itensor[3][3])
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double ione[3][3];
   for (i = 0; i < 3; i++)
     for (j = 0; j < 3; j++)
@@ -1417,12 +1630,10 @@ void Group::inertia(int igroup, double *cm, double itensor[3][3])
 
   for (i = 0; i < nlocal; i++)
     if (mask[i] & groupbit) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       ione[0][0] += massone * (dy*dy + dz*dz);
@@ -1450,20 +1661,19 @@ void Group::inertia(int igroup, double *cm, double itensor[3][3], int iregion)
 
   int groupbit = bitmask[igroup];
   Region *region = domain->regions[iregion];
+  region->prematch();
 
   double **x = atom->x;
   int *mask = atom->mask;
   int *type = atom->type;
-  tagint *image = atom->image;
+  imageint *image = atom->image;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
   int nlocal = atom->nlocal;
 
-  int xbox,ybox,zbox;
   double dx,dy,dz,massone;
-  double xprd = domain->xprd;
-  double yprd = domain->yprd;
-  double zprd = domain->zprd;
+  double unwrap[3];
+
   double ione[3][3];
   for (i = 0; i < 3; i++)
     for (j = 0; j < 3; j++)
@@ -1471,12 +1681,10 @@ void Group::inertia(int igroup, double *cm, double itensor[3][3], int iregion)
 
   for (i = 0; i < nlocal; i++)
     if (mask[i] & groupbit && region->match(x[i][0],x[i][1],x[i][2])) {
-      xbox = (image[i] & IMGMASK) - IMGMAX;
-      ybox = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-      zbox = (image[i] >> IMG2BITS) - IMGMAX;
-      dx = (x[i][0] + xbox*xprd) - cm[0];
-      dy = (x[i][1] + ybox*yprd) - cm[1];
-      dz = (x[i][2] + zbox*zprd) - cm[2];
+      domain->unmap(x[i],image[i],unwrap);
+      dx = unwrap[0] - cm[0];
+      dy = unwrap[1] - cm[1];
+      dz = unwrap[2] - cm[2];
       if (rmass) massone = rmass[i];
       else massone = mass[type[i]];
       ione[0][0] += massone * (dy*dy + dz*dz);
@@ -1495,7 +1703,7 @@ void Group::inertia(int igroup, double *cm, double itensor[3][3], int iregion)
 
 /* ----------------------------------------------------------------------
    compute angular velocity omega from L = Iw, inverting I to solve for w
-   really not a group operation, but L and I were computed for a group
+   really not a group/region operation, but L,I were computed for a group/region
 ------------------------------------------------------------------------- */
 
 void Group::omega(double *angmom, double inertia[3][3], double *w)
